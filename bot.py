@@ -406,10 +406,9 @@ async def run_bot() -> None:
 
 def main() -> None:
     validate_config()
-
-    # Renderのポート検知を通過させるため、裏スレッドで軽量Webサーバーを起動
-    threading.Thread(target=start_dummy_web_server, daemon=True).start()
-
+    
+　　from keep_alive import keep_alive
+　　keep_alive()
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
