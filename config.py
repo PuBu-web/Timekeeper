@@ -38,7 +38,7 @@ DB_PATH = resolve_path("DB_PATH", "data/siege_timekeeper_v4.db")
 LOG_PATH = resolve_path("LOG_PATH", "logs/siege_timekeeper_v4.log")
 
 # 初期値（設定.xlsxから上書き）
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
 IMAGE_INPUT_CHANNEL_ID = _env_int("IMAGE_INPUT_CHANNEL_ID", 1479759079227527199)
 TIMEKEEPER_CHANNEL_ID = _env_int("TIMEKEEPER_CHANNEL_ID", 1223112232775323663)
 LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID", 0)
