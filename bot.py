@@ -407,8 +407,8 @@ async def run_bot() -> None:
 def main() -> None:
     validate_config()
     
-　　from keep_alive import keep_alive
-　　keep_alive()
+    from keep_alive import keep_alive
+    keep_alive()
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
