@@ -335,7 +335,7 @@ class SiegeTimekeeperBot(discord.Client):
             self.processing_hashes.discard(image_hash)
 
     async def _send_startup_notifications(self) -> None:
-    return  # 👈 これを追加で起動通知出さない
+        return  # 👈 これを追加で起動通知出さない
         notifications = [
             (config.IMAGE_INPUT_CHANNEL_ID, "🚀  BOT起動しました\n占領ログの画像を受け付けています。"),
             (config.TIMEKEEPER_CHANNEL_ID, "🚀  BOT起動しました\nタイムキーパー稼働中です。"),
@@ -352,7 +352,7 @@ class SiegeTimekeeperBot(discord.Client):
                 logger.exception("起動通知の送信に失敗: %s", channel_id)
 
     async def _send_startup_notifications(self) -> None:
-    return  # 👈 これを追加で終了通知を出さない
+        return  # 👈 これを追加で終了通知を出さない
         notifications = [
             (config.IMAGE_INPUT_CHANNEL_ID, "🛑 BOT終了しました\n占領ログ画像の受付を停止しました。"),
             (config.TIMEKEEPER_CHANNEL_ID, "🛑 BOT終了しました\nタイムキーパーを停止しました。"),
