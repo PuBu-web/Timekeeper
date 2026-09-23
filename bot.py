@@ -5,16 +5,18 @@ import hashlib
 import logging
 import mimetypes
 import os
+import threading
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import discord
 
 import config
 from image_analyzer import GeminiImageAnalyzer
-from time_utils import parse_timestamp
 from masters import CityMaster, GuildMaster, normalize_text
 from storage import Storage
+from time_utils import parse_timestamp
 
 config.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -26,6 +28,26 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("siege_timekeeper_v411_unconfirmed_notice")
+
+
+# Renderのポートスキャンを通過させるためのダミーWebサーバー
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        # アクセスログでコンソールが埋まらないよう抑制
+        return
+
+
+def start_dummy_web_server() -> None:
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info("🌐 Render用ダミーWebサーバー起動: ポート %d", port)
+    server.serve_forever()
 
 
 # Windowsのコンソール右上「×」を検知するため、コールバックを保持する。
@@ -185,10 +207,6 @@ class SiegeTimekeeperBot(discord.Client):
                     raw_coord = normalize_text(record.coordinate).replace(".", ",")
                     coord_display = raw_coord if raw_coord else "座標不明"
 
-                    # Version4.1.1:
-                    # 城を安全に確定できなくても、時刻と軍団が読めていれば
-                    # タイムキーパーへ「OCR未確定」として残す。
-                    # 未確定データから城名を学習することはしない。
                     guild_full = normalize_text(record.guild_name)
                     resolution = self.guild_master.resolve(guild_full, auto_add=False)
                     guild_short = resolution.short_name
@@ -196,7 +214,7 @@ class SiegeTimekeeperBot(discord.Client):
 
                     warning_output = (
                         f"[{occupied_at:%H:%M:%S}] "
-                        f"⚠️OCR未確定【{raw_city}】 {coord_display}　"
+                        f"⚠️OCR未確定【{raw_city}】 {coord_display} "
                         f"{guild_emoji}{guild_short}"
                     )
 
@@ -223,7 +241,7 @@ class SiegeTimekeeperBot(discord.Client):
                         f"理由: {reason}"
                     )
                     continue
-                
+
                 raw_coord = normalize_text(record.coordinate).replace(".", ",")
                 raw_city = normalize_text(record.city_name)
                 if raw_city != city.name or raw_coord != city.coordinate:
@@ -265,7 +283,7 @@ class SiegeTimekeeperBot(discord.Client):
                 output = (
                     f"[{next_time:%H:%M:%S}]"
                     f"【{city.emoji}{city.county}】"
-                    f"{city.name}{city.coordinate}　"
+                    f"{city.name}{city.coordinate} "
                     f"{guild_emoji}{guild_short}"
                 )
 
@@ -349,7 +367,6 @@ class SiegeTimekeeperBot(discord.Client):
                 logger.exception("終了通知の送信に失敗: %s", channel_id)
 
     async def close(self) -> None:
-        # Ctrl+Cなどの正常終了時、Discord接続を閉じる前に1回だけ終了通知を送る。
         if self.is_ready() and not self.shutdown_notified:
             self.shutdown_notified = True
             await self._send_shutdown_notifications()
@@ -389,6 +406,10 @@ async def run_bot() -> None:
 
 def main() -> None:
     validate_config()
+
+    # Renderのポート検知を通過させるため、裏スレッドで軽量Webサーバーを起動
+    threading.Thread(target=start_dummy_web_server, daemon=True).start()
+
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
