@@ -4,23 +4,39 @@ import difflib
 import re
 import unicodedata
 import threading
+import time
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from openpyxl import load_workbook
+import gspread
+from google.oauth2.service_account import Credentials
+
+import config
 
 FACTION_EMOJI = {"魏": "🔵", "蜀": "🟢", "呉": "🔴"}
 
-
 def normalize_text(value: str) -> str:
     value = unicodedata.normalize("NFKC", value or "")
-    value = value.replace(" ", "").replace("　", "")
+    value = value.replace(" ", "").replace(" ", "")
     return value.strip()
 
-
-def row_value(row, index: int):
+def row_value(row: list, index: int):
     """末尾が空欄の行でも安全に値を取得する。"""
     return row[index] if 0 <= index < len(row) else None
+
+def get_gclient():
+    """Render環境とローカル環境の両方で安全に認証情報を読み込む"""
+    cred_path = "/etc/secrets/credentials.json"
+    if not os.path.exists(cred_path):
+        cred_path = "credentials.json"
+        
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    credentials = Credentials.from_service_account_file(cred_path, scopes=scopes)
+    return gspread.authorize(credentials)
 
 
 @dataclass(frozen=True)
@@ -54,47 +70,48 @@ class GuildResolution:
     learning_error: str = ""
 
 
-class ExcelMaster:
-    """Version4.0の設定.xlsxを読み込み、保存時に自動リロードする。"""
+class SpreadsheetMaster:
+    """スプレッドシートを読み込み、API制限を回避しつつ自動保存する。"""
 
-    def __init__(self, xlsx_path: Path):
-        self.xlsx_path = xlsx_path
+    def __init__(self):
         self.by_name: dict[str, City] = {}
         self.city_aliases: dict[str, str] = {}
         self.guilds: dict[str, tuple[str, str]] = {}
         self.guild_aliases: dict[str, str] = {}
-        self._mtime = -1.0
+        
+        self._last_reload_time = 0.0
         self._write_lock = threading.RLock()
+        
         self.last_city_learning: tuple[str, str] | None = None
         self.last_city_learning_error = ""
         self.last_city_rejection_reason = ""
+        
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> bool:
-        if not self.xlsx_path.exists():
-            raise FileNotFoundError(f"Excelマスターが見つかりません: {self.xlsx_path}")
-        mtime = self.xlsx_path.stat().st_mtime
-        if not force and mtime == self._mtime:
+        now = time.time()
+        # 60秒以内の連続リロードはキャッシュを使ってAPIコールを節約する
+        if not force and (now - self._last_reload_time < 60):
             return False
 
-        wb = load_workbook(self.xlsx_path, read_only=True, data_only=True)
-        try:
-            for required_sheet in ("城データ", "軍団データ"):
-                if required_sheet not in wb.sheetnames:
-                    raise RuntimeError(f"設定.xlsx に『{required_sheet}』シートがありません")
-
-            city_ws = wb["城データ"]
-            headers = {
-                normalize_text(str(c.value or "")): i
-                for i, c in enumerate(next(city_ws.iter_rows(min_row=1, max_row=1)))
-            }
+        with self._write_lock:
+            gc = get_gclient()
+            sh = gc.open_by_key(config.SPREADSHEET_ID)
+            
+            # --- 城データの読み込み ---
+            city_ws = sh.worksheet("城データ")
+            city_data = city_ws.get_all_values()
+            if not city_data:
+                raise RuntimeError("スプレッドシートの『城データ』が空です")
+                
+            headers = {normalize_text(str(c or "")): i for i, c in enumerate(city_data[0])}
             required = ["城名", "X", "Y", "郡城", "国"]
             missing = [h for h in required if h not in headers]
             if missing:
                 raise RuntimeError("城データの列が不足しています: " + ", ".join(missing))
 
             cities: dict[str, City] = {}
-            for row in city_ws.iter_rows(min_row=2, values_only=True):
+            for row in city_data[1:]:
                 name = normalize_text(str(row_value(row, headers["城名"]) or ""))
                 if not name:
                     continue
@@ -113,54 +130,61 @@ class ExcelMaster:
                     faction=normalize_text(str(row_value(row, headers["国"]) or "")),
                 )
 
+            # --- 城OCR補正の読み込み ---
             city_aliases: dict[str, str] = {}
-            if "城OCR補正" in wb.sheetnames:
-                ws = wb["城OCR補正"]
-                h = {normalize_text(str(c.value or "")): i for i, c in enumerate(next(ws.iter_rows(min_row=1, max_row=1)))}
-                if "OCR誤読城名" in h and "正式城名" in h:
-                    for row in ws.iter_rows(min_row=2, values_only=True):
-                        wrong = normalize_text(str(row_value(row, h["OCR誤読城名"]) or ""))
-                        correct = normalize_text(str(row_value(row, h["正式城名"]) or ""))
-                        if wrong and correct:
-                            city_aliases[wrong] = correct
+            try:
+                ws = sh.worksheet("城OCR補正")
+                data = ws.get_all_values()
+                if data:
+                    h = {normalize_text(str(c or "")): i for i, c in enumerate(data[0])}
+                    if "OCR誤読城名" in h and "正式城名" in h:
+                        for row in data[1:]:
+                            wrong = normalize_text(str(row_value(row, h["OCR誤読城名"]) or ""))
+                            correct = normalize_text(str(row_value(row, h["正式城名"]) or ""))
+                            if wrong and correct:
+                                city_aliases[wrong] = correct
+            except gspread.exceptions.WorksheetNotFound:
+                pass
 
-            guild_ws = wb["軍団データ"]
-            gheaders = {
-                normalize_text(str(c.value or "")): i
-                for i, c in enumerate(next(guild_ws.iter_rows(min_row=1, max_row=1)))
-            }
+            # --- 軍団データの読み込み ---
+            guild_ws = sh.worksheet("軍団データ")
+            guild_data = guild_ws.get_all_values()
+            gheaders = {normalize_text(str(c or "")): i for i, c in enumerate(guild_data[0])}
             required_guild = ["正式軍団名", "登録名", "所属国"]
             missing_guild = [h for h in required_guild if h not in gheaders]
             if missing_guild:
                 raise RuntimeError("軍団データの列が不足しています: " + ", ".join(missing_guild))
 
             guilds: dict[str, tuple[str, str]] = {}
-            for row in guild_ws.iter_rows(min_row=2, values_only=True):
+            for row in guild_data[1:]:
                 full = self._core(str(row_value(row, gheaders["正式軍団名"]) or ""))
                 short = normalize_text(str(row_value(row, gheaders["登録名"]) or ""))
                 faction = normalize_text(str(row_value(row, gheaders["所属国"]) or ""))
                 if full and short:
                     guilds[full] = (short, faction)
 
+            # --- 軍団OCR補正の読み込み ---
             guild_aliases: dict[str, str] = {}
-            if "軍団OCR補正" in wb.sheetnames:
-                ws = wb["軍団OCR補正"]
-                h = {normalize_text(str(c.value or "")): i for i, c in enumerate(next(ws.iter_rows(min_row=1, max_row=1)))}
-                if "OCR誤読名" in h and "正式軍団名" in h:
-                    for row in ws.iter_rows(min_row=2, values_only=True):
-                        wrong = self._core(str(row_value(row, h["OCR誤読名"]) or ""))
-                        correct = self._core(str(row_value(row, h["正式軍団名"]) or ""))
-                        if wrong and correct:
-                            guild_aliases[wrong] = correct
+            try:
+                ws = sh.worksheet("軍団OCR補正")
+                data = ws.get_all_values()
+                if data:
+                    h = {normalize_text(str(c or "")): i for i, c in enumerate(data[0])}
+                    if "OCR誤読名" in h and "正式軍団名" in h:
+                        for row in data[1:]:
+                            wrong = self._core(str(row_value(row, h["OCR誤読名"]) or ""))
+                            correct = self._core(str(row_value(row, h["正式軍団名"]) or ""))
+                            if wrong and correct:
+                                guild_aliases[wrong] = correct
+            except gspread.exceptions.WorksheetNotFound:
+                pass
 
             self.by_name = cities
             self.city_aliases = city_aliases
             self.guilds = guilds
             self.guild_aliases = guild_aliases
-            self._mtime = mtime
+            self._last_reload_time = now
             return True
-        finally:
-            wb.close()
 
     @property
     def city_count(self) -> int:
@@ -173,7 +197,6 @@ class ExcelMaster:
         return len(self.guilds)
 
     def find_city(self, raw_name: str, raw_coordinate: str = "") -> City | None:
-        """Version4.1: 城名と座標を安全に照合し、見切れ推測の誤送信を防ぐ。"""
         self.reload()
         self.last_city_learning = None
         self.last_city_learning_error = ""
@@ -218,27 +241,19 @@ class ExcelMaster:
                     if best_key < second_key:
                         matched = best
 
-            # 座標が読めているのにマスター上の城が見つからない場合
             if matched is None:
                 expected = self.by_name.get(alias_corrected)
 
                 if expected is not None:
-                    # Version4.1.2:
-                    # 城名が正式名と完全一致していて、
-                    # 座標の数字が1文字だけ違う場合はOCR誤読として正式座標へ補正する。
-                    ocr_x = str(x)
-                    ocr_y = str(y)
-                    master_x = str(expected.x)
-                    master_y = str(expected.y)
+                    ocr_x, ocr_y = str(x), str(y)
+                    master_x, master_y = str(expected.x), str(expected.y)
 
                     one_digit_coordinate_error = False
-
                     if len(ocr_x) == len(master_x) and len(ocr_y) == len(master_y):
                         diff_count = (
                             sum(a != b for a, b in zip(ocr_x, master_x))
                             + sum(a != b for a, b in zip(ocr_y, master_y))
                         )
-
                         if diff_count == 1:
                             one_digit_coordinate_error = True
 
@@ -250,17 +265,13 @@ class ExcelMaster:
                             f"正式座標 {expected.coordinate} が大きく異なります"
                         )
                         return None
-
                 else:
-                    self.last_city_rejection_reason = (
-                        f"OCR座標 {coord} に一致・近接する城がありません"
-                    )
+                    self.last_city_rejection_reason = f"OCR座標 {coord} に一致・近接する城がありません"
                     return None
         elif coordinate_was_supplied:
             self.last_city_rejection_reason = f"座標形式が不完全です: {raw_coordinate}"
             return None
         else:
-            # 座標が完全に空の場合のみ、登録済みの正式名・補正名を利用する。
             if alias_corrected in self.by_name:
                 matched = self.by_name[alias_corrected]
             else:
@@ -272,7 +283,6 @@ class ExcelMaster:
             self.last_city_rejection_reason = f"城名『{name}』を安全に特定できません"
             return None
 
-        # 座標から確定した城とOCR城名が著しく違う場合も、見切れ推測を疑って除外する。
         similarity = difflib.SequenceMatcher(None, alias_corrected, matched.name).ratio() if alias_corrected else 0.0
         if cm and alias_corrected and alias_corrected != matched.name and similarity < 0.45:
             self.last_city_rejection_reason = (
@@ -280,7 +290,6 @@ class ExcelMaster:
             )
             return None
 
-        # 学習は、座標で安全に確定できた場合、または座標なしで十分近い名前の場合だけ行う。
         if matched is not None and name and name != matched.name and name not in self.city_aliases:
             try:
                 if self._append_learning("城OCR補正", "OCR誤読城名", "正式城名", name, matched.name):
@@ -347,59 +356,77 @@ class ExcelMaster:
     def _append_learning(
         self, sheet_name: str, wrong_header: str, correct_header: str, wrong: str, correct: str
     ) -> bool:
-        """確定できたOCR誤読を補正シートへ重複なしで保存する。"""
         wrong = normalize_text(wrong)
         correct = normalize_text(correct)
         if not wrong or not correct or wrong == correct:
             return False
 
         with self._write_lock:
-            wb = load_workbook(self.xlsx_path)
+            gc = get_gclient()
+            sh = gc.open_by_key(config.SPREADSHEET_ID)
             try:
-                if sheet_name not in wb.sheetnames:
-                    ws = wb.create_sheet(sheet_name)
-                    ws.append([wrong_header, correct_header, "メモ"])
-                else:
-                    ws = wb[sheet_name]
+                ws = sh.worksheet(sheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                ws = sh.add_worksheet(title=sheet_name, rows=100, cols=20)
+                ws.append_row([wrong_header, correct_header, "メモ"])
+            
+            all_data = ws.get_all_values()
+            if not all_data:
+                ws.append_row([wrong_header, correct_header, "メモ"])
+                all_data = ws.get_all_values()
+                
+            headers = {normalize_text(str(c or "")): i for i, c in enumerate(all_data[0])}
+            wrong_idx = headers.get(wrong_header, -1)
+            correct_idx = headers.get(correct_header, -1)
+            memo_idx = headers.get("メモ", -1)
+            
+            if wrong_idx == -1 or correct_idx == -1:
+                return False
 
-                headers = {normalize_text(str(c.value or "")): i + 1 for i, c in enumerate(ws[1])}
-                if wrong_header not in headers or correct_header not in headers:
-                    raise RuntimeError(f"{sheet_name}の列が不足しています")
+            for row in all_data[1:]:
+                if len(row) > wrong_idx and normalize_text(str(row[wrong_idx] or "")) == wrong:
+                    return False
 
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    existing_wrong = normalize_text(str(row[headers[wrong_header] - 1] or ""))
-                    if existing_wrong == wrong:
-                        return False
-
-                values = [None] * max(len(headers), 3)
-                values[headers[wrong_header] - 1] = wrong
-                values[headers[correct_header] - 1] = correct
-                if "メモ" in headers:
-                    values[headers["メモ"] - 1] = "学習版が自動登録"
-                ws.append(values)
-                wb.save(self.xlsx_path)
-            finally:
-                wb.close()
+            new_row = [""] * max(len(headers), 3)
+            new_row[wrong_idx] = wrong
+            new_row[correct_idx] = correct
+            if memo_idx != -1:
+                new_row[memo_idx] = "学習版が自動登録"
+                
+            ws.append_row(new_row)
 
         self.reload(force=True)
         return True
 
     def _append_unknown_guild(self, full_name: str, short_name: str) -> None:
-        """未登録軍団を軍団データへ仮登録する。所属国は空欄で、後から確認する。"""
-        wb = load_workbook(self.xlsx_path)
-        try:
-            ws = wb["軍団データ"]
-            headers = {normalize_text(str(c.value or "")): i + 1 for i, c in enumerate(ws[1])}
+        with self._write_lock:
+            gc = get_gclient()
+            sh = gc.open_by_key(config.SPREADSHEET_ID)
+            ws = sh.worksheet("軍団データ")
+            
+            all_data = ws.get_all_values()
+            headers = {normalize_text(str(c or "")): i for i, c in enumerate(all_data[0])}
+            name_idx = headers.get("正式軍団名", -1)
+            
+            if name_idx == -1:
+                return
+                
             existing = {
-                self._core(str(row[headers["正式軍団名"] - 1] or ""))
-                for row in ws.iter_rows(min_row=2, values_only=True)
-                if row
+                self._core(str(row[name_idx] or ""))
+                for row in all_data[1:] if len(row) > name_idx
             }
+            
             if full_name not in existing:
-                ws.append([full_name, short_name, "", "未登録のため自動追加。所属国を入力してください"])
-                wb.save(self.xlsx_path)
-        finally:
-            wb.close()
+                new_row = [""] * len(headers)
+                new_row[name_idx] = full_name
+                new_row[headers.get("登録名", 1)] = short_name
+                if "所属国" in headers:
+                    new_row[headers["所属国"]] = ""
+                
+                # 適当な空き列にメモを入れる（一番右の列を想定）
+                new_row[-1] = "未登録のため自動追加。所属国を入力してください"
+                ws.append_row(new_row)
+                
         self.reload(force=True)
 
     def short_guild_name(self, raw_name: str) -> str:
@@ -410,9 +437,19 @@ class ExcelMaster:
         return FACTION_EMOJI.get(result.faction or fallback_faction, "⚪")
 
 
+# --- シングルトン化してAPIコールを削減 ---
+_shared_master = None
+
+def get_shared_master():
+    global _shared_master
+    if _shared_master is None:
+        _shared_master = SpreadsheetMaster()
+    return _shared_master
+
+
 class CityMaster:
-    def __init__(self, xlsx_path: Path):
-        self.master = ExcelMaster(xlsx_path)
+    def __init__(self, xlsx_path: Path = None):
+        self.master = get_shared_master()
 
     def find(self, raw_name: str, raw_coordinate: str = "") -> City | None:
         return self.master.find_city(raw_name, raw_coordinate)
@@ -435,8 +472,8 @@ class CityMaster:
 
 
 class GuildMaster:
-    def __init__(self, xlsx_path: Path):
-        self.master = ExcelMaster(xlsx_path)
+    def __init__(self, xlsx_path: Path = None):
+        self.master = get_shared_master()
 
     def resolve(self, raw_name: str, auto_add: bool = True) -> GuildResolution:
         return self.master.resolve_guild(raw_name, auto_add)
