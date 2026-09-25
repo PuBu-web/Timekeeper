@@ -100,4 +100,4 @@ reload_excel_settings(force=True)
 
 ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
-SPREADSHEET_ID = https://docs.google.com/spreadsheets/d/1r1ttDFCg24mEj6kFdvO_Lum19izous3Lul29Pq9v2y4/edit?gid=1830775209#gid=1830775209
+SPREADSHEET_ID = https://docs.google.com/spreadsheets/d/1r1ttDFCg24mEj6kFdvO_Lum19izous3Lul29Pq9v2y4/edit?gid=1973236113#gid=1973236113
